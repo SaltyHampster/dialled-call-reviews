@@ -1,5 +1,5 @@
-// index.js — Dialled Call Review Notifications
-// Posts completed call review notes to each student's private 1-1 Discord channel
+// index.js — Dialled Call Reviews
+// Posts call submission alerts AND completed review notes to each student's 1-1 channel
 // Packages: discord.js, dotenv, express, cors, pg
 
 require("dotenv").config();
@@ -15,7 +15,6 @@ const pool = new Pool({
 });
 
 async function runMigrations() {
-  // Maps each student to their private 1-1 channel
   await pool.query(`
     CREATE TABLE IF NOT EXISTS student_channels (
       id         SERIAL PRIMARY KEY,
@@ -25,16 +24,17 @@ async function runMigrations() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
-  // Log of review notifications sent
   await pool.query(`
     CREATE TABLE IF NOT EXISTS review_log (
       id           SERIAL PRIMARY KEY,
       student_id   TEXT        NOT NULL,
       student_name TEXT        NOT NULL,
       call_date    TEXT,
+      event        TEXT        DEFAULT 'review',
       sent_at      TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  await pool.query(`ALTER TABLE review_log ADD COLUMN IF NOT EXISTS event TEXT DEFAULT 'review'`).catch(() => {});
   console.log("✅ DB ready");
 }
 
@@ -53,57 +53,66 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-// ── Discord embed: split long notes across fields ────────
-// Discord limits: embed description 4096 chars, field value 1024 chars
+// ── Embed: completed review (split long notes) ───────────
 function buildReviewEmbeds(studentName, callDate, notes, callLink, videoReviewLink) {
   const embeds = [];
 
   let headerText =
     `**Student:** ${studentName}\n` +
     `**Call submitted:** ${callDate}\n`;
-
-  if (callLink) {
-    headerText += `**Your call:** [Watch here](${callLink})\n`;
-  }
-  if (videoReviewLink) {
-    headerText += `**Video review:** [Watch here](${videoReviewLink})\n`;
-  }
-
+  if (callLink)        headerText += `**Your call:** [Watch here](${callLink})\n`;
+  if (videoReviewLink) headerText += `**Video review:** [Watch here](${videoReviewLink})\n`;
   headerText += "\nFull notes below 👇";
 
-  const header = new EmbedBuilder()
-    .setTitle("📞 Your Call Review is Ready")
-    .setDescription(headerText)
-    .setColor(BRAND_RED)
-    .setFooter({ text: "Dialled Coaching • Call Review" })
-    .setTimestamp();
+  embeds.push(
+    new EmbedBuilder()
+      .setTitle("📞 Your Call Review is Ready")
+      .setDescription(headerText)
+      .setColor(BRAND_RED)
+      .setFooter({ text: "Dialled Coaching • Call Review" })
+      .setTimestamp()
+  );
 
-  embeds.push(header);
-
-  // Split notes into chunks that fit embed descriptions (4096 limit, use 4000 for safety)
   const chunks = [];
   let remaining = notes;
   while (remaining.length > 0) {
-    if (remaining.length <= 4000) {
-      chunks.push(remaining);
-      break;
-    }
-    // Split on the last newline before 4000 chars to avoid breaking mid-sentence
+    if (remaining.length <= 4000) { chunks.push(remaining); break; }
     let splitAt = remaining.lastIndexOf("\n", 4000);
-    if (splitAt < 1000) splitAt = 4000; // fallback if no good break point
+    if (splitAt < 1000) splitAt = 4000;
     chunks.push(remaining.slice(0, splitAt));
     remaining = remaining.slice(splitAt);
   }
-
   for (const chunk of chunks) {
-    embeds.push(
-      new EmbedBuilder()
-        .setDescription(chunk)
-        .setColor(BRAND_RED)
-    );
+    embeds.push(new EmbedBuilder().setDescription(chunk).setColor(BRAND_RED));
   }
-
   return embeds;
+}
+
+// ── Embed: new call submitted ────────────────────────────
+function buildSubmittedEmbed(studentName, callDate, callLink, note) {
+  let desc =
+    `**Student:** ${studentName}\n` +
+    `**Submitted:** ${callDate}\n`;
+  if (callLink) desc += `**Call:** [Watch here](${callLink})\n`;
+  if (note)     desc += `\n**Note:** ${note}`;
+  desc += "\n\nYour call is in the queue — review coming soon. 👀";
+
+  return new EmbedBuilder()
+    .setTitle("📥 New Call Submitted for Review")
+    .setDescription(desc)
+    .setColor(BRAND_RED)
+    .setFooter({ text: "Dialled Coaching • Call Submitted" })
+    .setTimestamp();
+}
+
+// ── Helper: fetch a student's channel or null ────────────
+async function getStudentChannel(studentId) {
+  const mapping = await pool.query(
+    "SELECT channel_id FROM student_channels WHERE student_id = $1",
+    [studentId]
+  );
+  if (!mapping.rows.length) return null;
+  return client.channels.fetch(mapping.rows[0].channel_id);
 }
 
 // ── Express ──────────────────────────────────────────────
@@ -114,45 +123,65 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/",       (_, res) => res.send("Dialled Call Reviews is running 📞"));
 app.get("/health", (_, res) => res.json({ status: "ok" }));
 
-// POST /api/review-complete — Lovable calls this when a review is marked complete
+// POST /api/call-submitted — student submits a call
+// Body: { student_id, student_name, call_date, call_link, note }
+app.post("/api/call-submitted", requireApiKey, async (req, res) => {
+  try {
+    const { student_id, student_name, call_date, call_link, note } = req.body;
+    if (!student_id || !student_name) {
+      return res.status(400).json({ error: "student_id and student_name are required" });
+    }
+
+    const channel = await getStudentChannel(student_id);
+    if (!channel) {
+      return res.status(404).json({ error: `No Discord channel mapped for student_id '${student_id}'.` });
+    }
+
+    const dateText = call_date || new Date().toLocaleDateString("en-AU", {
+      day: "numeric", month: "long", year: "numeric",
+    });
+
+    await channel.send({
+      embeds: [buildSubmittedEmbed(student_name, dateText, call_link || null, note || null)],
+    });
+
+    await pool.query(
+      "INSERT INTO review_log (student_id, student_name, call_date, event) VALUES ($1, $2, $3, 'submitted')",
+      [student_id, student_name, dateText]
+    );
+
+    res.json({ success: true, message: `Submission notice posted to ${student_name}'s channel` });
+  } catch (err) {
+    console.error("Call submitted error:", err);
+    res.status(500).json({ error: "Something went wrong" });
+  }
+});
+
+// POST /api/review-complete — review marked complete
 // Body: { student_id, student_name, call_date, notes, call_link, video_review_link }
 app.post("/api/review-complete", requireApiKey, async (req, res) => {
   try {
     const { student_id, student_name, call_date, notes, call_link, video_review_link } = req.body;
-
     if (!student_id || !student_name || !notes) {
       return res.status(400).json({ error: "student_id, student_name and notes are required" });
     }
 
-    // Look up the student's 1-1 channel
-    const mapping = await pool.query(
-      "SELECT channel_id FROM student_channels WHERE student_id = $1",
-      [student_id]
-    );
-
-    if (!mapping.rows.length) {
-      return res.status(404).json({
-        error: `No Discord channel mapped for student_id '${student_id}'. Add one via POST /api/students.`,
-      });
+    const channel = await getStudentChannel(student_id);
+    if (!channel) {
+      return res.status(404).json({ error: `No Discord channel mapped for student_id '${student_id}'.` });
     }
-
-    const channelId = mapping.rows[0].channel_id;
-    const channel   = await client.channels.fetch(channelId);
 
     const dateText = call_date || new Date().toLocaleDateString("en-AU", {
       day: "numeric", month: "long", year: "numeric",
     });
 
     const embeds = buildReviewEmbeds(student_name, dateText, notes, call_link || null, video_review_link || null);
-
-    // Discord allows max 10 embeds per message — send in batches if needed
     for (let i = 0; i < embeds.length; i += 10) {
       await channel.send({ embeds: embeds.slice(i, i + 10) });
     }
 
-    // Log it
     await pool.query(
-      "INSERT INTO review_log (student_id, student_name, call_date) VALUES ($1, $2, $3)",
+      "INSERT INTO review_log (student_id, student_name, call_date, event) VALUES ($1, $2, $3, 'review')",
       [student_id, student_name, dateText]
     );
 
@@ -164,8 +193,6 @@ app.post("/api/review-complete", requireApiKey, async (req, res) => {
 });
 
 // ── Student ↔ channel mapping management ─────────────────
-
-// GET /api/students — list all mappings
 app.get("/api/students", requireApiKey, async (_, res) => {
   try {
     const result = await pool.query("SELECT * FROM student_channels ORDER BY name ASC");
@@ -175,8 +202,6 @@ app.get("/api/students", requireApiKey, async (_, res) => {
   }
 });
 
-// POST /api/students — add or update a mapping
-// Body: { student_id, name, channel_id }
 app.post("/api/students", requireApiKey, async (req, res) => {
   try {
     const { student_id, name, channel_id } = req.body;
@@ -196,7 +221,6 @@ app.post("/api/students", requireApiKey, async (req, res) => {
   }
 });
 
-// DELETE /api/students/:student_id — remove a mapping
 app.delete("/api/students/:student_id", requireApiKey, async (req, res) => {
   try {
     const result = await pool.query(
@@ -210,12 +234,9 @@ app.delete("/api/students/:student_id", requireApiKey, async (req, res) => {
   }
 });
 
-// GET /api/review-log — recent notifications sent
 app.get("/api/review-log", requireApiKey, async (_, res) => {
   try {
-    const result = await pool.query(
-      "SELECT * FROM review_log ORDER BY sent_at DESC LIMIT 50"
-    );
+    const result = await pool.query("SELECT * FROM review_log ORDER BY sent_at DESC LIMIT 50");
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: "Something went wrong" });
