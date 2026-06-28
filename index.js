@@ -385,6 +385,78 @@ app.delete("/api/students/:student_id", requireApiKey, async (req, res) => {
   }
 });
 
+// ── Accountability: read a student's progress ────────────
+// GET /api/accountability/progress/:student_id?days=30
+app.get("/api/accountability/progress/:student_id", requireApiKey, async (req, res) => {
+  try {
+    const days = Math.min(parseInt(req.query.days, 10) || 30, 365);
+    const result = await pool.query(
+      `SELECT log_date, job_apps, call_min, roleplay_min, note, streak, all_complete
+       FROM accountability_log
+       WHERE student_id = $1
+       ORDER BY log_date DESC
+       LIMIT $2`,
+      [req.params.student_id, days]
+    );
+
+    // Summary stats across the returned window
+    const rows = result.rows;
+    const totalDays    = rows.length;
+    const completeDays = rows.filter(r => r.all_complete).length;
+    const latestStreak = rows.length ? rows[0].streak : 0;
+    const totals = rows.reduce((acc, r) => ({
+      job_apps:     acc.job_apps     + (r.job_apps     || 0),
+      call_min:     acc.call_min     + (r.call_min     || 0),
+      roleplay_min: acc.roleplay_min + (r.roleplay_min || 0),
+    }), { job_apps: 0, call_min: 0, roleplay_min: 0 });
+
+    res.json({
+      student_id: req.params.student_id,
+      summary: {
+        days_logged:    totalDays,
+        days_complete:  completeDays,
+        current_streak: latestStreak,
+        completion_rate: totalDays ? Math.round((completeDays / totalDays) * 100) : 0,
+        totals,
+      },
+      entries: rows,
+    });
+  } catch (err) {
+    console.error("Progress fetch error:", err);
+    res.status(500).json({ error: "Something went wrong" });
+  }
+});
+
+// GET /api/accountability/overview — latest status for all enabled students
+app.get("/api/accountability/overview", requireApiKey, async (_, res) => {
+  try {
+    const today = new Date().toLocaleDateString("en-CA", { timeZone: "Australia/Sydney" });
+    const result = await pool.query(
+      `SELECT e.student_id, e.name, e.enabled,
+              l.job_apps, l.call_min, l.roleplay_min, l.all_complete, l.streak, l.log_date
+       FROM accountability_enabled e
+       LEFT JOIN accountability_log l
+         ON l.student_id = e.student_id AND l.log_date = $1
+       WHERE e.enabled = TRUE
+       ORDER BY e.name ASC`,
+      [today]
+    );
+    res.json(result.rows.map(r => ({
+      student_id:    r.student_id,
+      name:          r.name,
+      submitted_today: r.log_date != null,
+      all_complete:  r.all_complete || false,
+      streak:        r.streak || 0,
+      today: r.log_date ? {
+        job_apps: r.job_apps, call_min: r.call_min, roleplay_min: r.roleplay_min,
+      } : null,
+    })));
+  } catch (err) {
+    console.error("Overview fetch error:", err);
+    res.status(500).json({ error: "Something went wrong" });
+  }
+});
+
 app.get("/api/review-log", requireApiKey, async (_, res) => {
   try {
     const result = await pool.query("SELECT * FROM review_log ORDER BY sent_at DESC LIMIT 50");
